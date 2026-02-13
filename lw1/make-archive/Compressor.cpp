@@ -2,8 +2,8 @@
 #include "FileDesc.h"
 #include "TempFileManager.h"
 
+#include <fcntl.h>
 #include <iostream>
-#include <stdexcept>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -28,18 +28,16 @@ bool WaitForChild(pid_t pid, const std::string& fileName)
 	return true;
 }
 
-std::vector<CompressionContext> StartCompressionBatch(
-	const std::vector<std::string>& inputFiles,
-	size_t startIndex,
-	size_t count)
+CompressionResult CompressSequentially(const std::vector<std::string>& inputFiles)
 {
-	std::vector<CompressionContext> contexts;
-	contexts.reserve(count);
+	CompressionResult result;
+	result.compressedFiles.reserve(inputFiles.size());
+	result.tempFiles.reserve(inputFiles.size());
 
-	for (size_t i = 0; i < count && startIndex + i < inputFiles.size(); ++i)
+	for (const auto& inputFile : inputFiles)
 	{
-		const auto& inputFile = inputFiles[startIndex + i];
 		std::string tempPath = tempFileManager::CreateTempFile();
+		result.tempFiles.push_back(tempPath);
 
 		pid_t pid = fork();
 		if (pid == 0)
@@ -55,36 +53,17 @@ std::vector<CompressionContext> StartCompressionBatch(
 		else if (pid < 0)
 		{
 			perror("fork");
-			tempFileManager::CleanupTempFiles({ tempPath });
+			tempFileManager::CleanupTempFiles(result.tempFiles);
 			exit(EXIT_FAILURE);
 		}
 
-		contexts.push_back({ inputFile, tempPath, pid });
-	}
-
-	return contexts;
-}
-
-CompressionResult CompressSequentially(const std::vector<std::string>& inputFiles)
-{
-	CompressionResult result;
-	result.compressedFiles.reserve(inputFiles.size());
-	result.tempFiles.reserve(inputFiles.size());
-
-	for (const auto& inputFile : inputFiles)
-	{
-		auto contexts = StartCompressionBatch({ inputFile }, 0, 1);
-		const auto& ctx = contexts[0];
-
-		result.tempFiles.push_back(ctx.tempFile);
-
-		if (!WaitForChild(ctx.pid, inputFile))
+		if (!WaitForChild(pid, inputFile))
 		{
 			tempFileManager::CleanupTempFiles(result.tempFiles);
 			exit(EXIT_FAILURE);
 		}
 
-		result.compressedFiles.push_back(ctx.tempFile);
+		result.compressedFiles.push_back(tempPath);
 	}
 
 	return result;
@@ -96,17 +75,37 @@ CompressionResult CompressInParallel(const std::vector<std::string>& inputFiles,
 	result.compressedFiles.reserve(inputFiles.size());
 
 	size_t nextIdx = 0;
-	std::map<pid_t, CompressionContext> activeChildren;
+	std::map<pid_t, std::string> pidToInputFile;
+	std::map<pid_t, std::string> pidToTempFile;
 
-	while (nextIdx < inputFiles.size() || !activeChildren.empty())
+	while (nextIdx < inputFiles.size() || !pidToInputFile.empty())
 	{
-		while (nextIdx < inputFiles.size() && static_cast<int>(activeChildren.size()) < maxProcesses)
+		while (nextIdx < inputFiles.size() && static_cast<int>(pidToInputFile.size()) < maxProcesses)
 		{
-			auto batch = StartCompressionBatch(inputFiles, nextIdx, 1);
-			const auto& ctx = batch[0];
+			const std::string& inputFile = inputFiles[nextIdx];
+			std::string tempPath = tempFileManager::CreateTempFile();
 
-			activeChildren[ctx.pid] = ctx;
-			result.tempFiles.push_back(ctx.tempFile);
+			pid_t pid = fork();
+			if (pid == 0)
+			{
+				FileDesc outDesc(tempPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+				dup2(outDesc.GetDesc(), STDOUT_FILENO);
+				outDesc.Close();
+
+				execlp("gzip", "gzip", "-c", inputFile.c_str(), nullptr);
+				perror("execlp gzip");
+				_exit(EXIT_FAILURE);
+			}
+			else if (pid < 0)
+			{
+				perror("fork");
+				tempFileManager::CleanupTempFiles(result.tempFiles);
+				exit(EXIT_FAILURE);
+			}
+
+			pidToInputFile[pid] = inputFile;
+			pidToTempFile[pid] = tempPath;
+			result.tempFiles.push_back(tempPath);
 			++nextIdx;
 		}
 
@@ -119,22 +118,26 @@ CompressionResult CompressInParallel(const std::vector<std::string>& inputFiles,
 			exit(EXIT_FAILURE);
 		}
 
-		auto it = activeChildren.find(pid);
-		if (it == activeChildren.end())
+		auto itInput = pidToInputFile.find(pid);
+		auto itTemp = pidToTempFile.find(pid);
+		if (itInput == pidToInputFile.end() || itTemp == pidToTempFile.end())
 		{
 			continue;
 		}
 
-		const auto& ctx = it->second;
-		activeChildren.erase(it);
+		const std::string inputFile = itInput->second;
+		const std::string tempFile = itTemp->second;
+
+		pidToInputFile.erase(itInput);
+		pidToTempFile.erase(itTemp);
 
 		if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
 		{
-			result.compressedFiles.push_back(ctx.tempFile);
+			result.compressedFiles.push_back(tempFile);
 		}
 		else
 		{
-			std::cerr << "Error: gzip failed for '" << ctx.inputFile
+			std::cerr << "Error: gzip failed for '" << inputFile
 					  << "' (exit code " << WEXITSTATUS(status) << ")" << std::endl;
 			tempFileManager::CleanupTempFiles(result.tempFiles);
 			exit(EXIT_FAILURE);

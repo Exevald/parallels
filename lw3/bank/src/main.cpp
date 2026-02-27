@@ -1,47 +1,46 @@
 #include "Simulation.h"
 #include <iostream>
-#include <optional>
-
-struct Args
-{
-	int iterationsCount;
-	bool isConsoleModeEnabled;
-};
-
-Args ParseArgs(int argc, char* argv[])
-{
-	if (argc == 1)
-	{
-		return Args{ .isConsoleModeEnabled = true };
-	}
-	if (argc == 2)
-	{
-		return Args{ .iterationsCount = std::stoi(argv[1]) };
-	}
-	throw std::invalid_argument("Invalid arguments count\n"
-								"Usage: economy [NUM_ITERATIONS]");
-}
+#include <string>
 
 int main(int argc, char* argv[])
 {
 	try
 	{
-		auto args = ParseArgs(argc, argv);
-		auto simulation = Simulation();
-		int iterationsCount = args.iterationsCount;
+		int iterations = 1000;
+		bool parallel = true;
 
-		if (args.isConsoleModeEnabled)
+		if (argc > 1)
 		{
-			std::cout << "Please, insert iterations count\n";
-			std::cin >> iterationsCount;
+			iterations = std::stoi(argv[1]);
 		}
-		simulation.StartSimulation(iterationsCount);
-	}
-	catch (const std::exception& exception)
-	{
-		std::cout << exception.what() << "\n";
-		return EXIT_FAILURE;
-	}
 
-	return EXIT_SUCCESS;
+		Simulation sim(100000);
+
+		if (parallel)
+		{
+			std::cout << "Starting PARALLEL simulation: " << iterations << " iterations per actor...\n";
+			sim.RunParallel(iterations);
+		}
+		else
+		{
+			std::cout << "Starting SEQUENTIAL simulation: " << iterations << " total cycles...\n";
+			sim.RunSequential(iterations);
+		}
+
+		std::cout << "Simulation finished. Total Bank Operations: " << sim.GetTotalOps() << "\n";
+
+		if (sim.IsStateConsistent())
+		{
+			return 0;
+		}
+		else
+		{
+			return 1;
+		}
+	}
+	catch (const std::exception& e)
+	{
+		std::cerr << "Error: " << e.what() << std::endl;
+		return 1;
+	}
 }

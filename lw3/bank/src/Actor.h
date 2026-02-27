@@ -28,41 +28,35 @@ public:
 	explicit Actor(Money cash)
 		: m_cash(cash)
 	{
-		if (cash < 0)
-		{
-			throw std::out_of_range("Initial cash can't be negative");
-		}
 	}
 
-	[[nodiscard]] Money GetCash() const
+	virtual ~Actor() = default;
+
+	Money GetCash() const
 	{
+		std::lock_guard lock(m_mtx);
 		return m_cash;
 	}
 
-	[[nodiscard]] bool SendCash(Actor& recipient, Money amount)
+	bool SendCash(Actor& recipient, Money amount)
 	{
+		if (this == &recipient)
+		{
+			return true;
+		}
+		std::scoped_lock lock(m_mtx, recipient.m_mtx);
 		if (m_cash < amount)
 		{
 			return false;
 		}
 		m_cash -= amount;
-		recipient.AddCash(amount);
+		recipient.m_cash += amount;
 		return true;
 	}
 
-	[[nodiscard]] bool StealCash(Actor& victim, Money amount)
+	bool StealCash(Actor& victim, Money amount)
 	{
 		return victim.SendCash(*this, amount);
-	}
-
-	virtual void Act(Actors& actors) = 0;
-
-	virtual ~Actor() = default;
-
-protected:
-	void AddCash(Money amount)
-	{
-		m_cash += amount;
 	}
 
 	bool SpendCash(Money amount)
@@ -71,48 +65,70 @@ protected:
 		{
 			return false;
 		}
+		std::lock_guard lock(m_mtx);
 		m_cash -= amount;
 		return true;
 	}
 
-private:
+	void ReceiveCashFromWorld(Money amount)
+	{
+		std::lock_guard lock(m_mtx);
+		m_cash += amount;
+	}
+
+	void OnAccountClosed(Money amount)
+	{
+		std::lock_guard lock(m_mtx);
+		m_cash += amount;
+	}
+
+	virtual void Act(struct Actors& actors) = 0;
+
+protected:
+	mutable std::mutex m_mtx;
 	Money m_cash;
+
+	void AddCash(Money amount)
+	{
+		std::lock_guard lock(m_mtx);
+		m_cash += amount;
+	}
 };
 
 class ActorWithBankAccount : public Actor
 {
 public:
-	ActorWithBankAccount(Money cash, AccountId accountId, Bank& bank)
+	ActorWithBankAccount(Money cash, AccountId id, Bank& bank)
 		: Actor(cash)
-		, m_accountId(accountId)
+		, m_accountId(id)
 		, m_bank(bank)
 	{
-		ActorWithBankAccount::DepositMoney(cash);
 	}
 
-	[[nodiscard]] Money GetAccountBalance() const
+	Money GetAccountBalance() const
 	{
-		return m_bank.GetAccountBalance(m_accountId);
+		return m_bank.GetAccountBalance(GetAccountId());
 	}
 
-	[[nodiscard]] AccountId GetAccountId() const
+	AccountId GetAccountId() const
 	{
+		std::lock_guard lock(m_idMtx);
 		return m_accountId;
 	}
 
-	[[nodiscard]] bool SendMoney(AccountId dstAccountId, Money amount)
+	bool SendMoney(AccountId dstId, Money amount)
 	{
-		return m_bank.TrySendMoney(m_accountId, dstAccountId, amount);
+		return m_bank.TrySendMoney(GetAccountId(), dstId, amount);
 	}
 
 	[[nodiscard]] bool StealMoney(AccountId victimAccountId, Money amount)
 	{
-		return m_bank.TrySendMoney(victimAccountId, m_accountId, amount);
+		return m_bank.TrySendMoney(victimAccountId, GetAccountId(), amount);
 	}
 
 	[[nodiscard]] bool WithdrawMoney(Money amount)
 	{
-		if (m_bank.TryWithdrawMoney(m_accountId, amount))
+		if (m_bank.TryWithdrawMoney(GetAccountId(), amount))
 		{
 			AddCash(amount);
 			return true;
@@ -124,25 +140,33 @@ public:
 	{
 		if (SpendCash(amount))
 		{
-			m_bank.DepositMoney(m_accountId, amount);
+			m_bank.DepositMoney(GetAccountId(), amount);
 			return true;
 		}
 		return false;
 	}
 
-	[[nodiscard]] Money CloseAccount()
+	Money CloseAccount()
 	{
-		Money balance = m_bank.CloseAccount(m_accountId);
-		AddCash(balance);
+		AccountId idToClose;
+		{
+			std::lock_guard lock(m_idMtx);
+			idToClose = m_accountId;
+			m_accountId = 0;
+		}
+		Money balance = m_bank.CloseAccount(idToClose);
+		this->OnAccountClosed(balance);
 		return balance;
 	}
 
 	void OpenAccount()
 	{
+		std::lock_guard lock(m_idMtx);
 		m_accountId = m_bank.OpenAccount();
 	}
 
 private:
+	mutable std::mutex m_idMtx;
 	AccountId m_accountId;
 	Bank& m_bank;
 };

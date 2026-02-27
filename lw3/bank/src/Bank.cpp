@@ -1,40 +1,12 @@
 #include "Bank.h"
 
-#include <algorithm>
-#include <stdexcept>
-
 namespace
 {
-void LockAccounts(std::mutex& a, std::mutex& b)
-{
-	if (std::addressof(a) == std::addressof(b))
-	{
-		a.lock();
-	}
-	else if (std::less<>{}(std::addressof(a), std::addressof(b)))
-	{
-		a.lock();
-		b.lock();
-	}
-	else
-	{
-		b.lock();
-		a.lock();
-	}
-}
-
-void UnlockAccounts(std::mutex& a, std::mutex& b)
-{
-	a.unlock();
-	if (std::addressof(a) != std::addressof(b))
-		b.unlock();
-}
-
-void ValidateAmount(Money amount)
+void EnsureNotNegative(Money amount)
 {
 	if (amount < 0)
 	{
-		throw std::out_of_range("Amount can't be negative");
+		throw std::out_of_range("amount cannot be negative");
 	}
 }
 } // namespace
@@ -43,155 +15,186 @@ Bank::Bank(Money cash)
 	: m_cash(cash)
 {
 	if (cash < 0)
+	{
 		throw BankOperationError("Initial cash can't be less than 0");
-}
-
-void Bank::SendMoney(AccountId srcId, AccountId dstId, Money amount)
-{
-	if (!TrySendMoney(srcId, dstId, amount))
-	{
-		throw BankOperationError("Insufficient funds in source account: " + std::to_string(srcId));
 	}
 }
 
-bool Bank::TrySendMoney(AccountId srcId, AccountId dstId, Money amount)
+void Bank::SendMoney(AccountId srcAccountId, AccountId dstAccountId, Money amount)
 {
-	ValidateAmount(amount);
-	if (srcId == dstId)
+	if (!SendMoneyInternal(srcAccountId, dstAccountId, amount, true))
 	{
-		return true;
+		throw BankOperationError("insufficient funds on source account");
 	}
-
-	auto& srcAcc = GetAccountRef(srcId);
-	auto& dstAcc = GetAccountRef(dstId);
-
-	LockAccounts(srcAcc.mtx, dstAcc.mtx);
-	bool success = false;
-	try
-	{
-		if (srcAcc.balance >= amount)
-		{
-			srcAcc.balance -= amount;
-			dstAcc.balance += amount;
-			success = true;
-		}
-	}
-	catch (...)
-	{
-		UnlockAccounts(srcAcc.mtx, dstAcc.mtx);
-		throw;
-	}
-	UnlockAccounts(srcAcc.mtx, dstAcc.mtx);
-	return success;
 }
 
-Money Bank::GetCash() const noexcept
+bool Bank::TrySendMoney(AccountId srcAccountId, AccountId dstAccountId, Money amount)
 {
-	std::lock_guard lock(m_cashMutex);
+	return SendMoneyInternal(srcAccountId, dstAccountId, amount, false);
+}
+
+Money Bank::GetCash() const
+{
+	std::shared_lock lock(m_cashMutex);
+	m_operationsCount.fetch_add(1, std::memory_order_relaxed);
 	return m_cash;
 }
 
-Money Bank::GetAccountBalance(AccountId id) const
+Money Bank::GetAccountBalance(AccountId accountId) const
 {
-	const auto& acc = GetAccountRef(id);
-	std::lock_guard lock(acc.mtx);
+	std::shared_lock bankLock(m_bankMutex);
+	EnsureExist(accountId);
+
+	const auto& acc = m_accounts.at(accountId);
+	std::shared_lock accountLock(acc.mutex);
+	m_operationsCount.fetch_add(1, std::memory_order_relaxed);
 	return acc.balance;
 }
 
-void Bank::WithdrawMoney(AccountId id, Money amount)
+void Bank::WithdrawMoney(AccountId account, Money amount)
 {
-	ValidateAmount(amount);
-	auto& acc = GetAccountRef(id);
-
-	std::lock_guard accLock(acc.mtx);
-	std::lock_guard cashLock(m_cashMutex);
-
-	if (acc.balance < amount)
+	if (!WithdrawMoneyInternal(account, amount, true))
 	{
-		throw BankOperationError("Insufficient funds in account: " + std::to_string(id));
+		throw BankOperationError("insufficient funds on account");
 	}
-	acc.balance -= amount;
-	m_cash += amount;
 }
 
-bool Bank::TryWithdrawMoney(AccountId id, Money amount)
+bool Bank::TryWithdrawMoney(AccountId account, Money amount)
 {
-	ValidateAmount(amount);
-	auto& acc = GetAccountRef(id);
-
-	std::lock_guard accLock(acc.mtx);
-	std::lock_guard cashLock(m_cashMutex);
-
-	if (acc.balance < amount)
-	{
-		return false;
-	}
-	acc.balance -= amount;
-	m_cash += amount;
-	return true;
+	return WithdrawMoneyInternal(account, amount, false);
 }
 
-void Bank::DepositMoney(AccountId id, Money amount)
+void Bank::DepositMoney(AccountId accountId, Money amount)
 {
-	ValidateAmount(amount);
-	auto& acc = GetAccountRef(id);
+	EnsureNotNegative(amount);
+	std::shared_lock bankLock(m_bankMutex);
+	EnsureExist(accountId);
 
-	std::lock_guard cashLock(m_cashMutex);
+	auto& acc = m_accounts.at(accountId);
+	std::unique_lock accountLock(acc.mutex);
+	std::unique_lock cashLock(m_cashMutex);
+
 	if (m_cash < amount)
 	{
-		throw BankOperationError("Insufficient cash in bank");
+		throw BankOperationError("Bank register cash is less than deposit amount");
 	}
-	std::lock_guard accLock(acc.mtx);
-	m_cash -= amount;
+
 	acc.balance += amount;
+	m_cash -= amount;
+	m_operationsCount.fetch_add(1);
 }
 
 AccountId Bank::OpenAccount()
 {
-	std::lock_guard lock(m_bankMutex);
-	AccountId newId = m_nextAccountId++;
-	m_accounts.try_emplace(newId);
-
-	return newId;
+	std::unique_lock bankLock(m_bankMutex);
+	const auto id = m_nextAccountId++;
+	m_accounts.emplace(std::piecewise_construct, std::forward_as_tuple(id), std::forward_as_tuple());
+	m_operationsCount.fetch_add(1, std::memory_order_relaxed);
+	return id;
 }
 
-Money Bank::CloseAccount(AccountId id)
+Money Bank::CloseAccount(AccountId accountId)
 {
-	std::lock_guard globalLock(m_bankMutex);
-	auto it = m_accounts.find(id);
-	if (it == m_accounts.end())
-	{
-		throw BankOperationError("Account not found: " + std::to_string(id));
-	}
-	Money balance = it->second.balance;
-	m_accounts.erase(it);
+	std::unique_lock bankLock(m_bankMutex);
+	EnsureExist(accountId);
 
-	{
-		std::lock_guard cashLock(m_cashMutex);
-		m_cash += balance;
-	}
+	auto it = m_accounts.find(accountId);
+	Money balance = it->second.balance;
+
+	std::unique_lock cashLock(m_cashMutex);
+	m_accounts.erase(it);
+	m_cash += balance;
+	m_operationsCount.fetch_add(1, std::memory_order_relaxed);
 
 	return balance;
 }
 
-Bank::Account& Bank::GetAccountRef(AccountId id)
+bool Bank::SendMoneyInternal(AccountId srcId, AccountId dstId, Money amount, bool throwOnError)
 {
-	std::lock_guard lock(m_bankMutex);
-	auto it = m_accounts.find(id);
-	if (it == m_accounts.end())
+	EnsureNotNegative(amount);
+	std::shared_lock bankLock(m_bankMutex);
+	EnsureExist(srcId, dstId);
+
+	if (srcId == dstId)
 	{
-		throw BankOperationError("Account not found: " + std::to_string(id));
+		m_operationsCount.fetch_add(1);
+		return true;
 	}
-	return it->second;
+
+	auto& src = m_accounts.at(srcId);
+	auto& dst = m_accounts.at(dstId);
+
+	if (srcId < dstId)
+	{
+		std::lock_guard l1(src.mutex);
+		std::lock_guard l2(dst.mutex);
+		if (src.balance < amount)
+		{
+			if (throwOnError)
+			{
+				throw BankOperationError("No money");
+			}
+			return false;
+		}
+		src.balance -= amount;
+		dst.balance += amount;
+	}
+	else
+	{
+		std::lock_guard l1(dst.mutex);
+		std::lock_guard l2(src.mutex);
+		if (src.balance < amount)
+		{
+			if (throwOnError)
+			{
+				throw BankOperationError("No money");
+			}
+			return false;
+		}
+		src.balance -= amount;
+		dst.balance += amount;
+	}
+	m_operationsCount.fetch_add(1);
+
+	return true;
 }
 
-const Bank::Account& Bank::GetAccountRef(AccountId id) const
+bool Bank::WithdrawMoneyInternal(AccountId accountId, Money amount, bool throwOnError)
 {
-	std::lock_guard lock(m_bankMutex);
-	auto it = m_accounts.find(id);
-	if (it == m_accounts.end())
+	EnsureNotNegative(amount);
+	std::shared_lock bankLock(m_bankMutex);
+	EnsureExist(accountId);
+
+	auto& acc = m_accounts.at(accountId);
+	std::unique_lock accountLock(acc.mutex);
+
+	if (acc.balance < amount)
 	{
-		throw BankOperationError("Account not found: " + std::to_string(id));
+		if (throwOnError)
+			throw BankOperationError("insufficient funds");
+		return false;
 	}
-	return it->second;
+
+	std::unique_lock cashLock(m_cashMutex);
+	acc.balance -= amount;
+	m_cash += amount;
+	m_operationsCount.fetch_add(1, std::memory_order_relaxed);
+
+	return true;
+}
+
+void Bank::EnsureExist(AccountId id) const
+{
+	if (m_accounts.find(id) == m_accounts.end())
+	{
+		throw BankOperationError("account " + std::to_string(id) + " does not exist");
+	}
+}
+
+void Bank::EnsureExist(AccountId id1, AccountId id2) const
+{
+	if (m_accounts.find(id1) == m_accounts.end() || m_accounts.find(id2) == m_accounts.end())
+	{
+		throw BankOperationError("one or both accounts do not exist");
+	}
 }

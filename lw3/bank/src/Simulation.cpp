@@ -1,88 +1,171 @@
 #include "Simulation.h"
 
-Simulation::Simulation()
+#include <iostream>
+#include <syncstream>
+#include <vector>
+
+Simulation::Simulation(Money totalEconomyMoney)
+	: m_initialCash(totalEconomyMoney)
 {
 	m_bank = std::make_unique<Bank>(m_initialCash);
 
-	m_homerAccount = m_bank->OpenAccount();
-	m_margeAccount = m_bank->OpenAccount();
-	m_apuAccount = m_bank->OpenAccount();
-	m_mrBurnsAccount = m_bank->OpenAccount();
-	m_snakeAccount = m_bank->OpenAccount();
-	m_smithersAccount = m_bank->OpenAccount();
+	m_homer = std::make_unique<Homer>(0, 0, *m_bank);
+	m_marge = std::make_unique<Marge>(0, 0, *m_bank);
+	m_bart = std::make_unique<Bart>(0);
+	m_lisa = std::make_unique<Lisa>(0);
+	m_apu = std::make_unique<Apu>(0, 0, *m_bank);
+	m_mrBurns = std::make_unique<MrBurns>(0, 0, *m_bank);
+	m_nelson = std::make_unique<Nelson>(0);
+	m_snake = std::make_unique<Snake>(0, 0, *m_bank);
+	m_smithers = std::make_unique<Smithers>(0, 0, *m_bank);
 
-	m_homer = std::make_unique<Homer>(8000, m_homerAccount, *m_bank);
-	m_marge = std::make_unique<Marge>(2000, m_margeAccount, *m_bank);
-	m_bart = std::make_unique<Bart>(250);
-	m_lisa = std::make_unique<Lisa>(250);
-	m_apu = std::make_unique<Apu>(5000, m_apuAccount, *m_bank);
-	m_mrBurns = std::make_unique<MrBurns>(50000, m_mrBurnsAccount, *m_bank);
-	m_nelson = std::make_unique<Nelson>(250);
-	m_snake = std::make_unique<Snake>(250, m_snakeAccount, *m_bank);
-	m_smithers = std::make_unique<Smithers>(9000, m_smithersAccount, *m_bank);
+	std::vector<Actor*> allActors = {
+		m_homer.get(), m_marge.get(), m_bart.get(), m_lisa.get(),
+		m_apu.get(), m_mrBurns.get(), m_nelson.get(), m_snake.get(), m_smithers.get()
+	};
 
-	m_actors.homer = m_homer.get();
-	m_actors.marge = m_marge.get();
-	m_actors.bart = m_bart.get();
-	m_actors.lisa = m_lisa.get();
-	m_actors.apu = m_apu.get();
-	m_actors.mrBurns = m_mrBurns.get();
-	m_actors.nelson = m_nelson.get();
-	m_actors.snake = m_snake.get();
-	m_actors.smithers = m_smithers.get();
+	Money share = m_initialCash / static_cast<Money>(allActors.size());
+	for (auto* actor : allActors)
+	{
+		actor->ReceiveCashFromWorld(share);
+	}
+	m_mrBurns->ReceiveCashFromWorld(static_cast<long long>(m_initialCash % allActors.size()));
+
+	auto initAccount = [](ActorWithBankAccount* a, Money deposit) {
+		a->OpenAccount();
+		if (deposit > 0)
+		{
+			a->DepositMoney(deposit);
+		}
+	};
+
+	initAccount(m_homer.get(), 4000);
+	initAccount(m_marge.get(), 2000);
+	initAccount(m_apu.get(), 10000);
+	initAccount(m_mrBurns.get(), 50000);
+	initAccount(m_snake.get(), 500);
+	initAccount(m_smithers.get(), 3000);
+
+	m_actorsRefs = {
+		m_homer.get(), m_marge.get(), m_bart.get(), m_lisa.get(),
+		m_apu.get(), m_mrBurns.get(), m_nelson.get(), m_snake.get(), m_smithers.get()
+	};
 }
 
-void Simulation::StartSimulation(int iterationsCount)
+void Simulation::ActorWorker(Actor* actor, int iterations, const std::stop_token& stoken)
 {
-	for (int i = 0; i < iterationsCount; i++)
+	for (int i = 0; i < iterations; ++i)
 	{
-		m_homer->Act(m_actors);
-		m_marge->Act(m_actors);
-		m_bart->Act(m_actors);
-		m_lisa->Act(m_actors);
-		m_apu->Act(m_actors);
-		m_mrBurns->Act(m_actors);
-		m_nelson->Act(m_actors);
-		m_snake->Act(m_actors);
-		m_smithers->Act(m_actors);
+		if (stoken.stop_requested())
+		{
+			break;
+		}
+
+		try
+		{
+			actor->Act(m_actorsRefs);
+		}
+		catch (const BankOperationError& e)
+		{
+			std::osyncstream(std::cout) << "Transaction skipped: " << e.what() << std::endl;
+		}
+		catch (const std::exception& e)
+		{
+			std::osyncstream(std::cerr) << "Error: " << e.what() << std::endl;
+		}
+		std::this_thread::yield();
 	}
-	if (Simulation::IsStateConsistent())
+}
+
+void Simulation::RunSequential(int iterations)
+{
+	std::vector<Actor*> targets = {
+		m_homer.get(), m_marge.get(), m_bart.get(), m_lisa.get(),
+		m_apu.get(), m_mrBurns.get(), m_nelson.get(), m_snake.get(), m_smithers.get()
+	};
+
+	for (int i = 0; i < iterations; ++i)
 	{
-		std::cout << "State is consistent\n";
+		for (auto* actor : targets)
+		{
+			try
+			{
+				actor->Act(m_actorsRefs);
+			}
+			catch (...)
+			{
+			}
+		}
 	}
-	else
+}
+
+void Simulation::RunParallel(int iterations)
+{
+	m_threads.clear();
+	std::vector<Actor*> targets = {
+		m_homer.get(), m_marge.get(), m_bart.get(), m_lisa.get(),
+		m_apu.get(), m_mrBurns.get(), m_nelson.get(), m_snake.get(), m_smithers.get()
+	};
+
+	for (auto* actor : targets)
 	{
-		std::cout << "State is not consistent\n";
+		m_threads.emplace_back([this, actor, iterations](const std::stop_token& st) {
+			this->ActorWorker(actor, iterations, st);
+		});
 	}
 }
 
 bool Simulation::IsStateConsistent() const
 {
-	const Money bankCash = m_bank->GetCash();
+	Money totalOnAccounts = 0;
+	Money totalInHands = 0;
 
-	const Money totalCharacterCash = m_homer->GetCash()
-		+ m_marge->GetCash()
-		+ m_bart->GetCash()
-		+ m_lisa->GetCash()
-		+ m_apu->GetCash()
-		+ m_mrBurns->GetCash()
-		+ m_nelson->GetCash()
-		+ m_snake->GetCash()
-		+ m_smithers->GetCash();
+	std::vector<Actor*> allActors = {
+		m_homer.get(), m_marge.get(), m_bart.get(), m_lisa.get(),
+		m_apu.get(), m_mrBurns.get(), m_nelson.get(), m_snake.get(), m_smithers.get()
+	};
 
-	const Money totalCharacterBalance = m_homer->GetAccountBalance()
-		+ m_marge->GetAccountBalance()
-		+ m_apu->GetAccountBalance()
-		+ m_mrBurns->GetAccountBalance()
-		+ m_snake->GetAccountBalance()
-		+ m_smithers->GetAccountBalance();
+	for (auto* actor : allActors)
+	{
+		totalInHands += actor->GetCash();
+	}
+	auto getAccBalance = [](ActorWithBankAccount* a) {
+		try
+		{
+			return a->GetAccountBalance();
+		}
+		catch (...)
+		{
+			return 0LL;
+		}
+	};
 
-	const Money totalMoney = totalCharacterBalance + totalCharacterCash;
-	std::cout << "Bank cash: " << bankCash << "\n"
-			  << "Total accounts: " << totalCharacterBalance << "\n"
-			  << "Total character cash: " << totalCharacterCash << "\n"
-			  << "Initial cash: " << m_initialCash << "\n"
-			  << "Total money: " << totalMoney << "\n";
+	totalOnAccounts += getAccBalance(m_homer.get());
+	totalOnAccounts += getAccBalance(m_marge.get());
+	totalOnAccounts += getAccBalance(m_apu.get());
+	totalOnAccounts += getAccBalance(m_mrBurns.get());
+	totalOnAccounts += getAccBalance(m_snake.get());
+	totalOnAccounts += getAccBalance(m_smithers.get());
 
-	return totalMoney == m_initialCash;
+	Money bankCash = m_bank->GetCash();
+	Money totalMoney = totalOnAccounts + bankCash;
+
+	bool cashConsistency = (totalInHands == bankCash);
+	bool totalConsistency = (totalMoney == m_initialCash);
+
+	std::osyncstream(std::cout)
+		<< "\n=== BANK'S CONSISTENCY REPORT ===\n"
+		<< "Cash in Actors' pockets: " << totalInHands << "\n"
+		<< "Cash in Bank's register: " << bankCash << "\n"
+		<< "Total on Bank Accounts:  " << totalOnAccounts << "\n"
+		<< "-----------------------------------\n"
+		<< "System Total:         " << totalMoney << "\n"
+		<< "Expected Initial Total:     " << m_initialCash << "\n"
+		<< "-----------------------------------\n"
+		<< "Cash Consistency Check:     " << (cashConsistency ? "PASSED" : "FAILED") << "\n"
+		<< "Total Money Check:          " << (totalConsistency ? "PASSED" : "FAILED") << "\n"
+		<< "===================================\n"
+		<< std::endl;
+
+	return cashConsistency && totalConsistency;
 }

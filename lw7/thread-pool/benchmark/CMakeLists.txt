@@ -1,0 +1,5 @@
+add_executable(lockfree_thread_pool_benchmark
+		ThreadPoolBenchmark.cpp
+)
+
+target_link_libraries(lockfree_thread_pool_benchmark PRIVATE lw7_thread_pool_lib timer_lib)
